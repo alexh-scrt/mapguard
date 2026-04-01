@@ -1,6 +1,7 @@
 """CLI entry point for mapguard.
 
 Provides the main argparse-based command-line interface with three subcommands:
+
 - scan-dir: Scan a local directory for source map issues
 - scan-tarball: Scan a local .tgz tarball for source map issues
 - scan-npm: Fetch and scan a published npm package by name and optional version
@@ -28,7 +29,7 @@ _EXIT_FINDINGS = 1
 _EXIT_USAGE = 2
 _EXIT_ERROR = 3
 
-# Default minimum risk level that triggers a non-zero exit
+# Default minimum risk level that triggers a non-zero exit code
 _DEFAULT_MIN_RISK = "HIGH"
 
 
@@ -52,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  mapguard scan-npm lodash@4.17.21\n"
             "  mapguard scan-npm @babel/core --json\n"
             "  mapguard scan-dir ./dist --min-risk CRITICAL\n"
+            "  mapguard scan-npm my-package --no-remediation\n"
         ),
     )
 
@@ -194,11 +196,17 @@ def build_parser() -> argparse.ArgumentParser:
 def cmd_scan_dir(args: argparse.Namespace) -> int:
     """Execute the scan-dir subcommand.
 
+    Scans a local directory recursively for .map files and sourceMappingURL
+    references in JavaScript/TypeScript bundle files.
+
     Args:
-        args: Parsed CLI arguments.
+        args: Parsed CLI arguments containing:
+            - args.directory: Path to the directory to scan.
+            - args.label: Optional human-readable label.
 
     Returns:
-        int: Exit code.
+        int: Exit code (0 = no high-risk findings, 1 = findings above threshold,
+            3 = fatal error).
     """
     from mapguard.scanner import Scanner
 
@@ -213,6 +221,9 @@ def cmd_scan_dir(args: argparse.Namespace) -> int:
     except NotADirectoryError as exc:
         _print_error(str(exc), args)
         return _EXIT_ERROR
+    except PermissionError as exc:
+        _print_error(f"Permission denied accessing directory: {exc}", args)
+        return _EXIT_ERROR
     except Exception as exc:  # noqa: BLE001
         _print_error(f"Unexpected error during scan: {exc}", args)
         return _EXIT_ERROR
@@ -223,8 +234,13 @@ def cmd_scan_dir(args: argparse.Namespace) -> int:
 def cmd_scan_tarball(args: argparse.Namespace) -> int:
     """Execute the scan-tarball subcommand.
 
+    Extracts a .tgz tarball to a temporary directory and scans its contents
+    for .map files and sourceMappingURL references.
+
     Args:
-        args: Parsed CLI arguments.
+        args: Parsed CLI arguments containing:
+            - args.tarball: Path to the tarball file.
+            - args.label: Optional human-readable label.
 
     Returns:
         int: Exit code.
@@ -242,6 +258,9 @@ def cmd_scan_tarball(args: argparse.Namespace) -> int:
     except tarfile.TarError as exc:
         _print_error(f"Failed to read tarball: {exc}", args)
         return _EXIT_ERROR
+    except PermissionError as exc:
+        _print_error(f"Permission denied reading tarball: {exc}", args)
+        return _EXIT_ERROR
     except Exception as exc:  # noqa: BLE001
         _print_error(f"Unexpected error during scan: {exc}", args)
         return _EXIT_ERROR
@@ -252,16 +271,21 @@ def cmd_scan_tarball(args: argparse.Namespace) -> int:
 def cmd_scan_npm(args: argparse.Namespace) -> int:
     """Execute the scan-npm subcommand.
 
-    Downloads the package tarball from the npm registry and scans it.
+    Downloads the package tarball from the npm registry, then scans it for
+    .map files and sourceMappingURL references.
 
     Args:
-        args: Parsed CLI arguments.
+        args: Parsed CLI arguments containing:
+            - args.package: Package specifier (name[@version]).
+            - args.registry: Registry base URL.
+            - args.timeout: HTTP timeout in seconds.
 
     Returns:
         int: Exit code.
     """
     import tempfile
-    from mapguard.npm_fetcher import NpmFetcher, NpmFetchError
+
+    from mapguard.npm_fetcher import NpmFetchError, NpmFetcher
     from mapguard.scanner import Scanner
 
     fetcher = NpmFetcher(registry=args.registry, timeout=args.timeout)
@@ -290,7 +314,7 @@ def cmd_scan_npm(args: argparse.Namespace) -> int:
                 _print_error(str(exc), args)
                 return _EXIT_ERROR
             except tarfile.TarError as exc:
-                _print_error(f"Failed to read tarball: {exc}", args)
+                _print_error(f"Failed to read downloaded tarball: {exc}", args)
                 return _EXIT_ERROR
             except Exception as exc:  # noqa: BLE001
                 _print_error(f"Unexpected error during scan: {exc}", args)
@@ -298,6 +322,8 @@ def cmd_scan_npm(args: argparse.Namespace) -> int:
 
             return _handle_result(result, args)
 
+    except SystemExit:
+        raise
     except Exception as exc:  # noqa: BLE001
         _print_error(f"Unexpected error: {exc}", args)
         return _EXIT_ERROR
@@ -306,9 +332,13 @@ def cmd_scan_npm(args: argparse.Namespace) -> int:
 def _handle_result(result: object, args: argparse.Namespace) -> int:
     """Render the scan result and return the appropriate exit code.
 
+    Delegates to the reporter for output (rich terminal or JSON), collects
+    remediation advice when applicable, and computes the exit code based on
+    whether any findings meet or exceed the configured minimum risk level.
+
     Args:
-        result: A ScanResult object.
-        args: Parsed CLI arguments.
+        result: A ScanResult object produced by the scanner.
+        args: Parsed CLI arguments used for output mode and threshold settings.
 
     Returns:
         int: 0 if no findings at or above min_risk, 1 otherwise.
@@ -318,7 +348,9 @@ def _handle_result(result: object, args: argparse.Namespace) -> int:
     from mapguard.reporter import Reporter
     from mapguard.risk import RiskLevel
 
-    assert isinstance(result, ScanResult)
+    if not isinstance(result, ScanResult):  # pragma: no cover
+        _print_error("Internal error: unexpected result type.", args)
+        return _EXIT_ERROR
 
     min_risk = RiskLevel(args.min_risk)
     use_color = not (args.no_color or args.json_output)
@@ -334,6 +366,7 @@ def _handle_result(result: object, args: argparse.Namespace) -> int:
             advice = advisor.advise(result.findings)
         reporter.print_rich(result, advice=advice if not args.no_remediation else None)
 
+        # Print any non-fatal errors encountered during scanning
         if result.scan_errors:
             _print_scan_errors(result.scan_errors, use_color)
 
@@ -343,14 +376,19 @@ def _handle_result(result: object, args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
-def _print_error(message: str, args: Optional[argparse.Namespace] = None) -> None:
-    """Print an error message to stderr.
+def _print_error(
+    message: str,
+    args: Optional[argparse.Namespace] = None,
+) -> None:
+    """Print an error message to stderr, or a JSON error object to stdout.
 
-    If JSON mode is active, write a JSON error object to stdout instead.
+    When the `--json` flag is active, writes a structured JSON error object to
+    stdout so that automated consumers always receive valid JSON.  Otherwise,
+    writes a plain text message to stderr.
 
     Args:
         message: The error message string.
-        args: Parsed CLI arguments, used to check JSON mode.
+        args: Parsed CLI arguments, used to check whether JSON mode is active.
     """
     import json as _json
 
@@ -362,22 +400,31 @@ def _print_error(message: str, args: Optional[argparse.Namespace] = None) -> Non
         sys.stderr.write(f"[mapguard] error: {message}\n")
 
 
-def _print_status(message: str, args: Optional[argparse.Namespace] = None) -> None:
+def _print_status(
+    message: str,
+    args: Optional[argparse.Namespace] = None,  # noqa: ARG001
+) -> None:
     """Print a status/progress message to stderr.
 
+    Progress messages are always written to stderr so they do not interfere
+    with stdout output (which may be JSON being piped to another tool).
+
     Args:
-        message: The status message.
-        args: Parsed CLI arguments (unused; reserved for future use).
+        message: The status message to display.
+        args: Parsed CLI arguments (reserved for future use).
     """
     sys.stderr.write(f"[mapguard] {message}\n")
 
 
 def _print_scan_errors(errors: list[str], use_color: bool) -> None:
-    """Print scan errors using rich or plain text.
+    """Print non-fatal scan errors encountered during file processing.
+
+    Errors are written to stderr using rich formatting (if colour is enabled)
+    so they stand out visually without polluting the main output stream.
 
     Args:
-        errors: List of error strings recorded during the scan.
-        use_color: Whether to use rich colour output.
+        errors: List of error message strings recorded during the scan.
+        use_color: Whether to use rich colour/style codes.
     """
     from rich.console import Console
 
@@ -398,17 +445,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     """Main entry point for the mapguard CLI.
 
     Parses command-line arguments, dispatches to the appropriate subcommand
-    handler, and returns an exit code.
+    handler, and returns a numeric exit code.
 
     Args:
         argv: Optional list of argument strings.  Defaults to ``sys.argv[1:]``
             when ``None``.
 
     Returns:
-        int: Exit code (0 = OK, 1 = findings, 2 = usage error, 3 = fatal).
+        int: Exit code:
+            0 = scan passed (no findings above threshold),
+            1 = scan found issues above threshold,
+            2 = argument/usage error,
+            3 = fatal runtime error.
     """
     parser = build_parser()
-    args = parser.parse_args(argv)
+
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        # argparse calls sys.exit(2) on argument errors; propagate cleanly.
+        return int(exc.code) if exc.code is not None else _EXIT_USAGE
 
     dispatch = {
         "scan-dir": cmd_scan_dir,
@@ -417,7 +473,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     }
 
     handler = dispatch.get(args.command)
-    if handler is None:
+    if handler is None:  # pragma: no cover
         parser.print_help(sys.stderr)
         return _EXIT_USAGE
 
@@ -426,13 +482,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     except KeyboardInterrupt:
         sys.stderr.write("\n[mapguard] Interrupted by user.\n")
         return _EXIT_ERROR
+    except Exception as exc:  # noqa: BLE001
+        _print_error(f"Unhandled exception: {exc}", args)
+        return _EXIT_ERROR
 
 
 def entrypoint() -> None:
-    """Console script entry point that calls :func:`main` and calls sys.exit.
+    """Console script entry point that calls :func:`main` and invokes sys.exit.
 
-    This is the function referenced by the ``[project.scripts]`` entry in
-    ``pyproject.toml``.
+    This function is referenced by the ``[project.scripts]`` entry in
+    ``pyproject.toml``:
+
+    .. code-block:: toml
+
+        [project.scripts]
+        mapguard = "mapguard.cli:entrypoint"
+
+    It simply delegates to :func:`main` and passes the return value to
+    ``sys.exit`` so the shell receives the correct exit code.
     """
     sys.exit(main())
 

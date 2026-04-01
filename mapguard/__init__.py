@@ -5,7 +5,8 @@ accidentally included source map (.map) files that reference or embed original
 source code. It assigns a risk level (LOW/MEDIUM/HIGH/CRITICAL) and provides
 actionable remediation steps.
 
-Typical usage:
+Typical usage::
+
     $ mapguard scan-dir ./my-package
     $ mapguard scan-tarball package.tgz
     $ mapguard scan-npm my-package@1.2.3
