@@ -13,7 +13,6 @@ Covers:
 from __future__ import annotations
 
 import base64
-import gzip
 import io
 import json
 import os
@@ -137,6 +136,11 @@ class TestScanDirectoryBasic:
         result = scanner.scan_directory(tmp_path)
         assert isinstance(result, ScanResult)
 
+    def test_scan_result_has_scan_errors_list(self, tmp_path):
+        scanner = Scanner()
+        result = scanner.scan_directory(tmp_path)
+        assert isinstance(result.scan_errors, list)
+
 
 # ---------------------------------------------------------------------------
 # scan_directory – .map file detection
@@ -221,6 +225,31 @@ class TestScanDirectoryMapFiles:
         scanner = Scanner()
         result = scanner.scan_directory(tmp_path)
         assert len(result.findings) == 1
+
+    def test_map_file_analysis_has_correct_file_path(self, tmp_path):
+        _write_file(
+            tmp_path,
+            "dist/app.js.map",
+            _make_map_json(sources=["src/app.ts"], sources_content=["code"]),
+        )
+        scanner = Scanner()
+        result = scanner.scan_directory(tmp_path)
+        finding = result.findings[0]
+        assert finding.analysis is not None
+        assert "app.js.map" in finding.analysis.file_path
+
+    def test_map_file_with_many_sources_is_high_or_critical(self, tmp_path):
+        sources = [f"src/module{i}.ts" for i in range(10)]
+        sources_content = [f"code {i}" for i in range(10)]
+        _write_file(
+            tmp_path,
+            "dist/large.js.map",
+            _make_map_json(sources=sources, sources_content=sources_content),
+        )
+        scanner = Scanner()
+        result = scanner.scan_directory(tmp_path)
+        assert len(result.findings) == 1
+        assert result.findings[0].risk_level >= RiskLevel.HIGH
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +357,34 @@ class TestScanDirectorySourceMappingUrl:
         result = scanner.scan_directory(tmp_path)
         assert result.findings[0].risk_level == RiskLevel.CRITICAL
 
+    def test_finding_type_is_source_mapping_url(self, tmp_path):
+        content = "var x = 1;\n//# sourceMappingURL=app.js.map\n"
+        _write_file(tmp_path, "dist/app.js", content)
+        scanner = Scanner()
+        result = scanner.scan_directory(tmp_path)
+        assert result.findings[0].finding_type == FindingType.SOURCE_MAPPING_URL
+
+    def test_ts_extension_scanned(self, tmp_path):
+        content = "export const x = 1;\n//# sourceMappingURL=ts.js.map\n"
+        _write_file(tmp_path, "dist/app.ts", content)
+        scanner = Scanner()
+        result = scanner.scan_directory(tmp_path)
+        assert len(result.findings) == 1
+
+    def test_tsx_extension_scanned(self, tmp_path):
+        content = "export const App = () => null;\n//# sourceMappingURL=tsx.js.map\n"
+        _write_file(tmp_path, "dist/App.tsx", content)
+        scanner = Scanner()
+        result = scanner.scan_directory(tmp_path)
+        assert len(result.findings) == 1
+
+    def test_jsx_extension_scanned(self, tmp_path):
+        content = "var x = 1;\n//# sourceMappingURL=jsx.js.map\n"
+        _write_file(tmp_path, "dist/app.jsx", content)
+        scanner = Scanner()
+        result = scanner.scan_directory(tmp_path)
+        assert len(result.findings) == 1
+
 
 # ---------------------------------------------------------------------------
 # scan_directory – combined map file + bundle file
@@ -357,17 +414,31 @@ class TestScanDirectoryCombined:
         assert result.source == "test-pkg@0.1.0"
 
     def test_scan_errors_captured_not_raised(self, tmp_path):
-        # Write a readable map and then make a second file unreadable.
+        # Write a readable map and verify scan_errors list exists
         _write_file(
             tmp_path,
             "dist/good.js.map",
             _make_map_json(sources=["src/good.ts"], sources_content=["ok"]),
         )
-        # We can't easily make a file unreadable in a cross-platform way in
-        # tests, but we can verify the scan_errors list exists and is a list.
         scanner = Scanner()
         result = scanner.scan_directory(tmp_path)
         assert isinstance(result.scan_errors, list)
+
+    def test_max_risk_reflects_highest_finding(self, tmp_path):
+        # One critical map file + one medium bundle reference
+        _write_file(
+            tmp_path,
+            "dist/critical.js.map",
+            _make_map_json(sources=["src/a.ts"], sources_content=["code"]),
+        )
+        _write_file(
+            tmp_path,
+            "dist/bundle.js",
+            "var x=1;\n//# sourceMappingURL=bundle.js.map\n",
+        )
+        scanner = Scanner()
+        result = scanner.scan_directory(tmp_path)
+        assert result.max_risk == RiskLevel.CRITICAL
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +532,22 @@ class TestScanTarballBasic:
         result = scanner.scan_tarball(str(tgz))
         assert isinstance(result, ScanResult)
 
+    def test_tarball_returns_scan_result(self):
+        tgz = _make_tgz({})
+        scanner = Scanner()
+        result = scanner.scan_tarball(tgz)
+        assert isinstance(result, ScanResult)
+
+    def test_critical_map_in_tarball(self):
+        map_content = _make_map_json(
+            sources=["src/index.ts"],
+            sources_content=["export const x = 42;"],
+        )
+        tgz = _make_tgz({"package/dist/app.js.map": map_content})
+        scanner = Scanner()
+        result = scanner.scan_tarball(tgz)
+        assert result.max_risk == RiskLevel.CRITICAL
+
 
 # ---------------------------------------------------------------------------
 # Integration: fixture files
@@ -480,6 +567,19 @@ class TestScannerWithFixtures:
         assert result.findings[0].risk_level == RiskLevel.CRITICAL
         assert result.findings[0].finding_type == FindingType.MAP_FILE
 
+    def test_sample_map_finding_has_embedded_content(self):
+        """sample.js.map finding should report has_embedded_content=True."""
+        content = (FIXTURES / "sample.js.map").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "dist" / "bundle.js.map"
+            target.parent.mkdir(parents=True)
+            target.write_text(content, encoding="utf-8")
+            scanner = Scanner()
+            result = scanner.scan_directory(tmpdir)
+        finding = result.findings[0]
+        assert finding.analysis.has_embedded_content is True
+        assert finding.analysis.embedded_content_count == 5
+
     def test_ref_only_map_is_not_critical(self):
         """ref_only.js.map has no embedded content (only null entries)."""
         content = (FIXTURES / "ref_only.js.map").read_text(encoding="utf-8")
@@ -493,6 +593,18 @@ class TestScannerWithFixtures:
         assert result.findings[0].risk_level != RiskLevel.CRITICAL
         assert result.findings[0].analysis.has_embedded_content is False
 
+    def test_ref_only_map_has_source_paths(self):
+        """ref_only.js.map should have source_file_paths populated."""
+        content = (FIXTURES / "ref_only.js.map").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "dist" / "ref_only.js.map"
+            target.parent.mkdir(parents=True)
+            target.write_text(content, encoding="utf-8")
+            scanner = Scanner()
+            result = scanner.scan_directory(tmpdir)
+        finding = result.findings[0]
+        assert len(finding.analysis.source_file_paths) == 2
+
     def test_sample_map_in_tarball_is_critical(self):
         map_content = (FIXTURES / "sample.js.map").read_text(encoding="utf-8")
         tgz = _make_tgz({"package/dist/bundle.js.map": map_content})
@@ -503,3 +615,31 @@ class TestScannerWithFixtures:
         ]
         assert len(map_findings) == 1
         assert map_findings[0].risk_level == RiskLevel.CRITICAL
+
+    def test_ref_only_map_in_tarball_not_critical(self):
+        map_content = (FIXTURES / "ref_only.js.map").read_text(encoding="utf-8")
+        tgz = _make_tgz({"package/dist/ref_only.js.map": map_content})
+        scanner = Scanner()
+        result = scanner.scan_tarball(tgz)
+        map_findings = [
+            f for f in result.findings if f.finding_type == FindingType.MAP_FILE
+        ]
+        assert len(map_findings) == 1
+        assert map_findings[0].risk_level != RiskLevel.CRITICAL
+
+    def test_both_fixtures_in_same_tarball(self):
+        """Both fixtures in the same tarball should produce two MAP_FILE findings."""
+        sample_content = (FIXTURES / "sample.js.map").read_text(encoding="utf-8")
+        ref_content = (FIXTURES / "ref_only.js.map").read_text(encoding="utf-8")
+        tgz = _make_tgz({
+            "package/dist/sample.js.map": sample_content,
+            "package/dist/ref_only.js.map": ref_content,
+        })
+        scanner = Scanner()
+        result = scanner.scan_tarball(tgz)
+        map_findings = [
+            f for f in result.findings if f.finding_type == FindingType.MAP_FILE
+        ]
+        assert len(map_findings) == 2
+        risk_levels = {f.risk_level for f in map_findings}
+        assert RiskLevel.CRITICAL in risk_levels

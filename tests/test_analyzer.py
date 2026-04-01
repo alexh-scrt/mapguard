@@ -85,6 +85,23 @@ class TestAnalysisResultDefaults:
         assert result.embedded_content_count == 3
         assert result.source_file_paths == ["src/a.ts"]
 
+    def test_source_root_default_none(self):
+        result = AnalysisResult()
+        assert result.source_root is None
+
+    def test_referenced_map_url_default_none(self):
+        result = AnalysisResult()
+        assert result.referenced_map_url is None
+
+    def test_parse_error_default_none(self):
+        result = AnalysisResult()
+        assert result.parse_error is None
+
+    def test_source_file_paths_default_empty_list(self):
+        result = AnalysisResult()
+        assert isinstance(result.source_file_paths, list)
+        assert len(result.source_file_paths) == 0
+
 
 # ---------------------------------------------------------------------------
 # SourceMapAnalyzer.analyze — core parsing
@@ -133,6 +150,24 @@ class TestAnalyzeBasic:
         result = self.analyzer.analyze(content, file_path="dist/app.js.map")
         assert result.file_path == "dist/app.js.map"
 
+    def test_file_path_defaults_to_empty_string(self):
+        content = _make_map()
+        result = self.analyzer.analyze(content)
+        assert result.file_path == ""
+
+    def test_json_null_returns_parse_error(self):
+        result = self.analyzer.analyze("null")
+        assert result.parse_error is not None
+
+    def test_json_string_returns_parse_error(self):
+        result = self.analyzer.analyze('"hello"')
+        assert result.parse_error is not None
+
+    def test_parse_error_is_none_for_valid_map(self):
+        content = _make_map(sources=["src/a.ts"], sources_content=["code"])
+        result = self.analyzer.analyze(content)
+        assert result.parse_error is None
+
 
 class TestAnalyzeSources:
     def setup_method(self):
@@ -164,6 +199,22 @@ class TestAnalyzeSources:
         result = self.analyzer.analyze(json.dumps(data))
         assert result.source_file_paths == []
 
+    def test_empty_sources_list_yields_empty_list(self):
+        content = _make_map(sources=[])
+        result = self.analyzer.analyze(content)
+        assert result.source_file_paths == []
+
+    def test_single_source_extracted(self):
+        content = _make_map(sources=["src/main.ts"])
+        result = self.analyzer.analyze(content)
+        assert result.source_file_paths == ["src/main.ts"]
+
+    def test_many_sources_all_extracted(self):
+        paths = [f"src/module_{i}.ts" for i in range(20)]
+        content = _make_map(sources=paths)
+        result = self.analyzer.analyze(content)
+        assert result.source_file_paths == paths
+
 
 class TestAnalyzeSourceRoot:
     def setup_method(self):
@@ -193,6 +244,11 @@ class TestAnalyzeSourceRoot:
         data = {"version": 3, "mappings": "", "sourceRoot": 42}
         result = self.analyzer.analyze(json.dumps(data))
         assert result.source_root is None
+
+    def test_valid_source_root_stored(self):
+        content = _make_map(source_root="/home/user/project/")
+        result = self.analyzer.analyze(content)
+        assert result.source_root == "/home/user/project/"
 
 
 class TestAnalyzeSourcesContent:
@@ -263,6 +319,22 @@ class TestAnalyzeSourcesContent:
         data = {"version": 3, "mappings": "", "sourcesContent": "not a list"}
         result = self.analyzer.analyze(json.dumps(data))
         assert result.has_embedded_content is False
+
+    def test_single_non_empty_entry_counted(self):
+        content = _make_map(
+            sources=["src/main.ts"],
+            sources_content=["export default function main() {}"],
+        )
+        result = self.analyzer.analyze(content)
+        assert result.has_embedded_content is True
+        assert result.embedded_content_count == 1
+
+    def test_five_entries_counted(self):
+        sources = [f"src/file{i}.ts" for i in range(5)]
+        contents = [f"code for file {i}" for i in range(5)]
+        content = _make_map(sources=sources, sources_content=contents)
+        result = self.analyzer.analyze(content)
+        assert result.embedded_content_count == 5
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +430,25 @@ class TestAnalyzeReference:
         )
         assert result.file_path == "dist/app.js"
 
+    def test_external_reference_has_no_embedded_content(self):
+        result = self.analyzer.analyze_reference(url="bundle.js.map")
+        assert result.has_embedded_content is False
+        assert result.embedded_content_count == 0
+
+    def test_external_reference_no_data_url(self):
+        result = self.analyzer.analyze_reference(url="bundle.js.map")
+        assert result.is_data_url is False
+
+    def test_data_url_with_multiple_sources_decoded(self):
+        sources = [f"src/file{i}.ts" for i in range(5)]
+        sources_content = [f"code {i}" for i in range(5)]
+        map_content = _make_map(sources=sources, sources_content=sources_content)
+        data_url = _b64_encode_map(map_content)
+        result = self.analyzer.analyze_reference(url=data_url)
+        assert result.has_embedded_content is True
+        assert result.embedded_content_count == 5
+        assert len(result.source_file_paths) == 5
+
 
 # ---------------------------------------------------------------------------
 # Fixture file tests
@@ -402,6 +493,18 @@ class TestSampleFixture:
         result = self.analyzer.analyze(self.content)
         assert result.raw_size_bytes > 0
 
+    def test_file_path_stored(self):
+        result = self.analyzer.analyze(self.content, file_path="sample.js.map")
+        assert result.file_path == "sample.js.map"
+
+    def test_sources_include_known_paths(self):
+        result = self.analyzer.analyze(self.content)
+        assert any("index" in p for p in result.source_file_paths)
+
+    def test_sources_include_secrets_file(self):
+        result = self.analyzer.analyze(self.content)
+        assert any("secret" in p.lower() for p in result.source_file_paths)
+
 
 class TestRefOnlyFixture:
     """Tests against tests/fixtures/ref_only.js.map (no embedded content)."""
@@ -437,3 +540,11 @@ class TestRefOnlyFixture:
     def test_source_root_empty_treated_as_none(self):
         result = self.analyzer.analyze(self.content)
         assert result.source_root is None
+
+    def test_raw_size_bytes_positive(self):
+        result = self.analyzer.analyze(self.content)
+        assert result.raw_size_bytes > 0
+
+    def test_file_path_stored(self):
+        result = self.analyzer.analyze(self.content, file_path="ref_only.js.map")
+        assert result.file_path == "ref_only.js.map"

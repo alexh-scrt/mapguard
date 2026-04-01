@@ -49,7 +49,7 @@ def _result(
 
 
 # ---------------------------------------------------------------------------
-# RiskLevel enum tests (additional coverage beyond test_models.py)
+# RiskLevel enum tests
 # ---------------------------------------------------------------------------
 
 class TestRiskLevelEnum:
@@ -59,6 +59,12 @@ class TestRiskLevelEnum:
 
     def test_from_value_low(self):
         assert RiskLevel("LOW") is RiskLevel.LOW
+
+    def test_from_value_medium(self):
+        assert RiskLevel("MEDIUM") is RiskLevel.MEDIUM
+
+    def test_from_value_high(self):
+        assert RiskLevel("HIGH") is RiskLevel.HIGH
 
     def test_from_value_critical(self):
         assert RiskLevel("CRITICAL") is RiskLevel.CRITICAL
@@ -104,6 +110,50 @@ class TestRiskLevelEnum:
         result = RiskLevel.LOW.__lt__("LOW")
         assert result is NotImplemented
 
+    def test_lt_ordering(self):
+        assert RiskLevel.LOW < RiskLevel.MEDIUM
+        assert RiskLevel.MEDIUM < RiskLevel.HIGH
+        assert RiskLevel.HIGH < RiskLevel.CRITICAL
+
+    def test_gt_ordering(self):
+        assert RiskLevel.CRITICAL > RiskLevel.HIGH
+        assert RiskLevel.HIGH > RiskLevel.MEDIUM
+        assert RiskLevel.MEDIUM > RiskLevel.LOW
+
+    def test_le_ordering(self):
+        assert RiskLevel.LOW <= RiskLevel.MEDIUM
+        assert RiskLevel.MEDIUM <= RiskLevel.HIGH
+        assert RiskLevel.HIGH <= RiskLevel.CRITICAL
+
+    def test_ge_ordering(self):
+        assert RiskLevel.CRITICAL >= RiskLevel.HIGH
+        assert RiskLevel.HIGH >= RiskLevel.MEDIUM
+        assert RiskLevel.MEDIUM >= RiskLevel.LOW
+
+    def test_low_value_string(self):
+        assert RiskLevel.LOW.value == "LOW"
+
+    def test_medium_value_string(self):
+        assert RiskLevel.MEDIUM.value == "MEDIUM"
+
+    def test_high_value_string(self):
+        assert RiskLevel.HIGH.value == "HIGH"
+
+    def test_critical_value_string(self):
+        assert RiskLevel.CRITICAL.value == "CRITICAL"
+
+    def test_ge_not_implemented_for_non_risk_level(self):
+        result = RiskLevel.LOW.__ge__("LOW")
+        assert result is NotImplemented
+
+    def test_le_not_implemented_for_non_risk_level(self):
+        result = RiskLevel.LOW.__le__("LOW")
+        assert result is NotImplemented
+
+    def test_gt_not_implemented_for_non_risk_level(self):
+        result = RiskLevel.LOW.__gt__("LOW")
+        assert result is NotImplemented
+
 
 # ---------------------------------------------------------------------------
 # RiskScorer CRITICAL rule
@@ -142,6 +192,14 @@ class TestRiskScorerCritical:
             embedded_count=2,
             source_paths=["/home/user/project/src/secret.ts"],
         )
+        assert self.scorer.score(analysis) == RiskLevel.CRITICAL
+
+    def test_single_source_with_content_is_critical(self):
+        analysis = _result(has_embedded=True, embedded_count=1, source_paths=["src/app.ts"])
+        assert self.scorer.score(analysis) == RiskLevel.CRITICAL
+
+    def test_data_url_with_embedded_content_is_critical(self):
+        analysis = _result(has_embedded=True, embedded_count=2, is_data_url=True)
         assert self.scorer.score(analysis) == RiskLevel.CRITICAL
 
 
@@ -235,6 +293,14 @@ class TestRiskScorerHigh:
         analysis = _result(source_paths=paths)
         assert self.scorer.score(analysis) == RiskLevel.HIGH
 
+    def test_lib_directory_is_high(self):
+        analysis = _result(source_paths=["lib/utils.js"])
+        assert self.scorer.score(analysis) == RiskLevel.HIGH
+
+    def test_credential_path_is_high(self):
+        analysis = _result(source_paths=["config/credentials.js"])
+        assert self.scorer.score(analysis) == RiskLevel.HIGH
+
 
 # ---------------------------------------------------------------------------
 # RiskScorer MEDIUM rule
@@ -259,6 +325,17 @@ class TestRiskScorerMedium:
 
     def test_external_reference_no_paths_is_medium(self):
         analysis = _result(is_external=True, source_paths=[])
+        assert self.scorer.score(analysis) == RiskLevel.MEDIUM
+
+    def test_four_non_sensitive_paths_is_medium(self):
+        # 4 paths < threshold of 5
+        paths = [f"dist/chunk_{i}.js" for i in range(4)]
+        analysis = _result(source_paths=paths)
+        assert self.scorer.score(analysis) == RiskLevel.MEDIUM
+
+    def test_below_threshold_with_safe_paths_is_medium(self):
+        paths = ["dist/a.js", "dist/b.js", "dist/c.js"]
+        analysis = _result(source_paths=paths)
         assert self.scorer.score(analysis) == RiskLevel.MEDIUM
 
 
@@ -287,6 +364,23 @@ class TestRiskScorerLow:
 
     def test_source_root_only_is_low(self):
         analysis = _result(source_root="webpack://")
+        assert self.scorer.score(analysis) == RiskLevel.LOW
+
+    def test_all_false_flags_is_low(self):
+        analysis = AnalysisResult(
+            file_path="x.js.map",
+            has_embedded_content=False,
+            embedded_content_count=0,
+            source_file_paths=[],
+            is_data_url=False,
+            is_external_reference=False,
+        )
+        assert self.scorer.score(analysis) == RiskLevel.LOW
+
+    def test_embedded_true_but_zero_count_is_not_critical(self):
+        # Edge case: has_embedded_content is True but count is 0
+        analysis = _result(has_embedded=True, embedded_count=0)
+        # Not CRITICAL, falls through to LOW
         assert self.scorer.score(analysis) == RiskLevel.LOW
 
 
@@ -336,6 +430,33 @@ class TestSensitivePathDetection:
         paths = ["dist/a.js", "dist/b.js", "dist/vendor.js"]
         assert self.scorer._has_sensitive_paths(paths) is False
 
+    def test_webpack_prefix_detected(self):
+        assert self.scorer._has_sensitive_paths(["webpack://./src/app.js"]) is True
+
+    def test_home_directory_unix_detected(self):
+        assert self.scorer._has_sensitive_paths(["/home/alice/project/main.js"]) is True
+
+    def test_users_directory_macos_detected(self):
+        assert self.scorer._has_sensitive_paths(["/Users/bob/dev/app.js"]) is True
+
+    def test_node_modules_detected(self):
+        assert self.scorer._has_sensitive_paths(["node_modules/react/index.js"]) is True
+
+    def test_internal_prefix_detected(self):
+        assert self.scorer._has_sensitive_paths(["internal/auth.js"]) is True
+
+    def test_private_prefix_detected(self):
+        assert self.scorer._has_sensitive_paths(["private/keys.js"]) is True
+
+    def test_token_keyword_detected(self):
+        assert self.scorer._has_sensitive_paths(["utils/token_store.js"]) is True
+
+    def test_api_key_keyword_detected(self):
+        assert self.scorer._has_sensitive_paths(["config/api_key.js"]) is True
+
+    def test_single_safe_dist_file(self):
+        assert self.scorer._has_sensitive_paths(["dist/output.js"]) is False
+
 
 # ---------------------------------------------------------------------------
 # Integration: fixture files
@@ -373,3 +494,30 @@ class TestRiskScorerWithFixtures:
         assert analysis.embedded_content_count > 0
         risk = self.scorer.score(analysis)
         assert risk == RiskLevel.CRITICAL
+
+    def test_ref_only_not_critical(self):
+        """ref_only.js.map should not be CRITICAL."""
+        content = (FIXTURES / "ref_only.js.map").read_text(encoding="utf-8")
+        analysis = self.analyzer.analyze(content)
+        risk = self.scorer.score(analysis)
+        assert risk != RiskLevel.CRITICAL
+
+    def test_sample_map_analysis_has_correct_count(self):
+        """sample.js.map should have exactly 5 embedded sources."""
+        content = (FIXTURES / "sample.js.map").read_text(encoding="utf-8")
+        analysis = self.analyzer.analyze(content)
+        assert analysis.embedded_content_count == 5
+
+    def test_ref_only_map_analysis_has_no_embedded_content(self):
+        """ref_only.js.map should have no embedded content."""
+        content = (FIXTURES / "ref_only.js.map").read_text(encoding="utf-8")
+        analysis = self.analyzer.analyze(content)
+        assert analysis.has_embedded_content is False
+        assert analysis.embedded_content_count == 0
+
+    def test_scorer_produces_risk_level_instance(self):
+        """score() always returns a RiskLevel instance."""
+        content = (FIXTURES / "sample.js.map").read_text(encoding="utf-8")
+        analysis = self.analyzer.analyze(content)
+        risk = self.scorer.score(analysis)
+        assert isinstance(risk, RiskLevel)
