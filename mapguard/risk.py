@@ -19,10 +19,12 @@ class RiskLevel(Enum):
     """Risk severity levels for source map findings.
 
     Attributes:
-        LOW: Map file present but no source content exposed.
-        MEDIUM: Map file references source file paths but no content.
-        HIGH: Multiple source files referenced or sensitive paths detected.
-        CRITICAL: Embedded source content (sourcesContent) is present.
+        LOW: Map file present but no meaningful source information exposed.
+        MEDIUM: Map file references source file paths but contains no embedded code.
+        HIGH: Multiple source files referenced, sensitive paths detected, or
+            an inline data URL source map is present without confirmed content.
+        CRITICAL: Embedded source content (sourcesContent) is present in the map,
+            exposing actual original source code.
     """
 
     LOW = "LOW"
@@ -30,95 +32,130 @@ class RiskLevel(Enum):
     HIGH = "HIGH"
     CRITICAL = "CRITICAL"
 
-    def __lt__(self, other: "RiskLevel") -> bool:
-        """Enable ordering of risk levels by severity."""
-        order = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
-        return order.index(self.value) < order.index(other.value)
+    # ------------------------------------------------------------------
+    # Ordering support — required for sorting, min/max, and comparisons
+    # ------------------------------------------------------------------
 
-    def __le__(self, other: "RiskLevel") -> bool:
-        """Enable ordering of risk levels by severity."""
-        return self == other or self < other
+    @staticmethod
+    def _order(value: str) -> int:
+        """Return the integer order index for a risk level value string."""
+        return ["LOW", "MEDIUM", "HIGH", "CRITICAL"].index(value)
 
-    def __gt__(self, other: "RiskLevel") -> bool:
-        """Enable ordering of risk levels by severity."""
-        order = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
-        return order.index(self.value) > order.index(other.value)
+    def __lt__(self, other: "RiskLevel") -> bool:  # type: ignore[override]
+        """Return True if this level is less severe than *other*."""
+        if not isinstance(other, RiskLevel):
+            return NotImplemented
+        return self._order(self.value) < self._order(other.value)
 
-    def __ge__(self, other: "RiskLevel") -> bool:
-        """Enable ordering of risk levels by severity."""
-        return self == other or self > other
+    def __le__(self, other: "RiskLevel") -> bool:  # type: ignore[override]
+        """Return True if this level is less than or equal in severity to *other*."""
+        if not isinstance(other, RiskLevel):
+            return NotImplemented
+        return self._order(self.value) <= self._order(other.value)
+
+    def __gt__(self, other: "RiskLevel") -> bool:  # type: ignore[override]
+        """Return True if this level is more severe than *other*."""
+        if not isinstance(other, RiskLevel):
+            return NotImplemented
+        return self._order(self.value) > self._order(other.value)
+
+    def __ge__(self, other: "RiskLevel") -> bool:  # type: ignore[override]
+        """Return True if this level is greater than or equal in severity to *other*."""
+        if not isinstance(other, RiskLevel):
+            return NotImplemented
+        return self._order(self.value) >= self._order(other.value)
 
 
-# Patterns that suggest sensitive internal paths
+# ---------------------------------------------------------------------------
+# Sensitive path patterns
+# ---------------------------------------------------------------------------
+# These patterns, when found in the source file paths listed in a source map,
+# indicate that the map exposes internal implementation details beyond what is
+# normal for a published package.
+
 _SENSITIVE_PATH_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"\bsrc/", re.IGNORECASE),
-    re.compile(r"\blib/", re.IGNORECASE),
-    re.compile(r"\binternal/", re.IGNORECASE),
-    re.compile(r"\bprivate/", re.IGNORECASE),
-    re.compile(r"\bsecret", re.IGNORECASE),
-    re.compile(r"\bpassword", re.IGNORECASE),
-    re.compile(r"\btoken", re.IGNORECASE),
-    re.compile(r"\bapi[_-]?key", re.IGNORECASE),
-    re.compile(r"\.ts$"),
-    re.compile(r"\.tsx$"),
+    # Common source directories
+    re.compile(r"(?:^|/)src/", re.IGNORECASE),
+    re.compile(r"(?:^|/)lib/", re.IGNORECASE),
+    re.compile(r"(?:^|/)internal/", re.IGNORECASE),
+    re.compile(r"(?:^|/)private/", re.IGNORECASE),
+    # Secret / credential related names
+    re.compile(r"\bsecret\b", re.IGNORECASE),
+    re.compile(r"\bpassword\b", re.IGNORECASE),
+    re.compile(r"\btoken\b", re.IGNORECASE),
+    re.compile(r"\bapi[_-]?key\b", re.IGNORECASE),
+    re.compile(r"\bcredential", re.IGNORECASE),
+    # TypeScript source files (usually not intended in published artefacts)
+    re.compile(r"\.tsx?$", re.IGNORECASE),
+    # Webpack virtual filesystem prefix
     re.compile(r"webpack://"),
+    # User home directory paths that indicate absolute paths leaked
+    re.compile(r"/home/[^/]"),
+    re.compile(r"/Users/[^/]"),
+    re.compile(r"[A-Za-z]:\\\\Users\\\\"),
+    re.compile(r"[A-Za-z]:/Users/"),
+    # node_modules references (unusual to see in sources array)
     re.compile(r"node_modules"),
-    re.compile(r"/home/"),
-    re.compile(r"/Users/"),
-    re.compile(r"C:\\\\Users\\\\"),
 ]
 
-# Threshold: number of source file references to escalate from MEDIUM to HIGH
-_HIGH_FILE_COUNT_THRESHOLD = 5
+# If this many or more source file paths are referenced the risk escalates to HIGH.
+_HIGH_FILE_COUNT_THRESHOLD: int = 5
 
 
 class RiskScorer:
-    """Scores findings based on source map analysis results.
+    """Scores source map findings using a rule-based priority system.
 
-    Uses a rule-based approach to determine risk level from an AnalysisResult
-    produced by the SourceMapAnalyzer.
+    The scoring rules are applied in strict priority order so that the most
+    severe applicable rule wins:
+
+    1. **CRITICAL** — ``sourcesContent`` array contains embedded source code.
+    2. **CRITICAL** — inline data: URL whose decoded payload has embedded content.
+    3. **HIGH** — inline data: URL (embedded map present even without confirmed content).
+    4. **HIGH** — one or more source paths match a sensitive pattern.
+    5. **HIGH** — the number of referenced source files meets or exceeds
+       ``_HIGH_FILE_COUNT_THRESHOLD``.
+    6. **MEDIUM** — source file paths are listed (but no embedded content).
+    7. **MEDIUM** — sourceMappingURL points to an external file.
+    8. **LOW** — .map file present but no actionable source information found.
     """
 
     def score(self, analysis: "AnalysisResult") -> RiskLevel:
-        """Compute the risk level for a given analysis result.
-
-        Scoring rules (applied in priority order):
-        1. CRITICAL - sourcesContent array is present with embedded code.
-        2. HIGH - data: URL (inline map) OR >= threshold source files referenced
-           OR sensitive path patterns detected.
-        3. MEDIUM - source file paths are referenced without embedded content.
-        4. LOW - .map file present but no actionable source info found.
+        """Compute the risk level for a given AnalysisResult.
 
         Args:
-            analysis: AnalysisResult from SourceMapAnalyzer.
+            analysis: AnalysisResult produced by SourceMapAnalyzer.
 
         Returns:
-            RiskLevel: The computed risk level.
+            RiskLevel: The computed risk severity level.
         """
-        # CRITICAL: embedded source content present
+        # ------------------------------------------------------------------
+        # CRITICAL: embedded source content present (highest priority)
+        # ------------------------------------------------------------------
         if analysis.has_embedded_content and analysis.embedded_content_count > 0:
             return RiskLevel.CRITICAL
 
-        # CRITICAL: inline data URL with embedded map
-        if analysis.is_data_url and analysis.has_embedded_content:
-            return RiskLevel.CRITICAL
-
-        # HIGH: data URL (even without verified content, the map is inlined)
+        # ------------------------------------------------------------------
+        # HIGH: data URL — even without confirmed sourcesContent the entire
+        # source map is inlined in the bundle which is a significant exposure.
+        # ------------------------------------------------------------------
         if analysis.is_data_url:
             return RiskLevel.HIGH
 
-        # Check for sensitive path patterns
-        has_sensitive_paths = self._has_sensitive_paths(analysis.source_file_paths)
+        # ------------------------------------------------------------------
+        # Check source file paths for sensitive patterns
+        # ------------------------------------------------------------------
+        has_sensitive = self._has_sensitive_paths(analysis.source_file_paths)
 
-        # HIGH: sensitive paths detected
-        if has_sensitive_paths:
+        if has_sensitive:
             return RiskLevel.HIGH
 
         # HIGH: large number of source files referenced
         if len(analysis.source_file_paths) >= _HIGH_FILE_COUNT_THRESHOLD:
             return RiskLevel.HIGH
 
-        # MEDIUM: source file paths referenced
+        # ------------------------------------------------------------------
+        # MEDIUM: source paths referenced without embedded content
+        # ------------------------------------------------------------------
         if analysis.source_file_paths:
             return RiskLevel.MEDIUM
 
@@ -126,17 +163,19 @@ class RiskScorer:
         if analysis.is_external_reference:
             return RiskLevel.MEDIUM
 
-        # LOW: map file present but minimal information exposed
+        # ------------------------------------------------------------------
+        # LOW: map file present but no meaningful info exposed
+        # ------------------------------------------------------------------
         return RiskLevel.LOW
 
     def _has_sensitive_paths(self, paths: list[str]) -> bool:
-        """Check whether any source path matches a sensitive pattern.
+        """Return True if any path in *paths* matches a sensitive pattern.
 
         Args:
-            paths: List of source file paths from the source map.
+            paths: List of source file paths from the source map's sources array.
 
         Returns:
-            bool: True if any path matches a known sensitive pattern.
+            bool: True if any path matches at least one sensitive pattern.
         """
         for path in paths:
             for pattern in _SENSITIVE_PATH_PATTERNS:

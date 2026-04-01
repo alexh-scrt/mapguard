@@ -1,0 +1,21 @@
+{
+  "version": 3,
+  "file": "bundle.js",
+  "sourceRoot": "webpack://my-app/",
+  "sources": [
+    "src/index.ts",
+    "src/utils/helpers.ts",
+    "src/components/App.tsx",
+    "src/api/client.ts",
+    "src/config/secrets.ts"
+  ],
+  "sourcesContent": [
+    "import { App } from './components/App';\nimport { initClient } from './api/client';\n\ninitClient();\n",
+    "export function clamp(n: number, min: number, max: number): number {\n  return Math.min(Math.max(n, min), max);\n}\n\nexport function slugify(s: string): string {\n  return s.toLowerCase().replace(/[^a-z0-9]+/g, '-');\n}\n",
+    "import React from 'react';\n\nexport const App: React.FC = () => (\n  <div className=\"app\">\n    <h1>Hello, world!</h1>\n  </div>\n);\n",
+    "import axios from 'axios';\n\nconst BASE_URL = process.env.API_BASE_URL;\n\nexport function initClient() {\n  return axios.create({ baseURL: BASE_URL });\n}\n",
+    "export const API_KEY = process.env.SECRET_API_KEY ?? '';\nexport const DB_PASSWORD = process.env.DB_PASSWORD ?? '';\n"
+  ],
+  "mappings": "AAAA,SAAS,GAAG,MAAM,oBAAoB",
+  "names": []
+}
